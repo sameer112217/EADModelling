@@ -1,0 +1,2617 @@
+proc contents data=credit.ead_base_raw varnum;
+run;
+
+proc means data=credit.ead_base_raw n nmiss;
+run;
+
+data credit.ead_base_raw_fix;
+    set credit.ead_base_raw;
+
+    if vtype(obs_month)='C' then obs_month_dt = input(obs_month, yymmdd10.);
+    else obs_month_dt = obs_month;
+
+    if vtype(default_month)='C' then default_month_dt = input(default_month, yymmdd10.);
+    else default_month_dt = default_month;
+
+    format obs_month_dt default_month_dt yymmdd10.;
+
+    drop obs_month default_month;
+    rename obs_month_dt=obs_month default_month_dt=default_month;
+run;
+
+proc sort data=credit.ead_base_raw_fix out=work._dedup;
+    by account_id default_month;
+run;
+
+data credit.default_events;
+    set work._dedup;
+    by account_id;
+    if first.account_id;
+
+    keep account_id default_month;
+    format default_month yymmn6.;
+run;
+data credit.monthly_panel;
+    set credit.ead_base_raw_fix;
+
+    keep account_id cust_id product_type segment country
+         obs_month default_month months_to_default
+         credit_limit outstanding_balance utilization_ratio
+         payment_amount min_payment_due annual_interest_rate dpd_days
+         ead_observed;
+run;
+
+data credit.monthly_panel;
+    set credit.monthly_panel;
+
+    months_to_default_calc = intck('month', obs_month, default_month);
+
+    months_to_default = months_to_default_calc;
+
+    drop months_to_default_calc;
+run;
+
+proc sql;
+    create table credit.obs_default_map as
+    select
+        a.account_id,
+        a.obs_month,
+        b.default_month,
+        intck('month', a.obs_month, b.default_month) as months_to_default
+    from credit.monthly_panel a
+    inner join credit.default_events b
+        on a.account_id = b.account_id
+    where calculated months_to_default between 1 and 12;
+quit;
+proc sql;
+    create table credit.ead_target as
+    select
+        account_id,
+        default_month,
+        max(ead_observed) as ead_observed
+    from credit.monthly_panel
+    group by account_id, default_month;
+quit;
+
+proc sql;
+    create table credit.ead_model_base as
+    select
+        a.account_id,
+        a.cust_id,
+        a.product_type,
+        a.segment,
+        a.country,
+        a.obs_month,
+        b.default_month,
+        b.months_to_default,
+        a.credit_limit,
+        a.outstanding_balance,
+        a.utilization_ratio,
+        a.payment_amount,
+        a.min_payment_due,
+        a.annual_interest_rate,
+        a.dpd_days,
+        c.ead_observed
+    from credit.monthly_panel a
+    inner join credit.obs_default_map b
+        on a.account_id = b.account_id
+       and a.obs_month  = b.obs_month
+    inner join credit.ead_target c
+        on a.account_id    = c.account_id
+       and b.default_month = c.default_month;
+quit;
+
+proc means data=credit.ead_model_base mean median p25 p75;
+    class product_type months_to_default;
+    var outstanding_balance ead_observed utilization_ratio;
+run;
+data _null_;
+    set credit.ead_model_base;
+    if obs_month >= default_month then put "ERROR: Leakage detected for account_id=" account_id;
+run;
+data credit.default_events;
+    set credit.ead_base_raw;
+    if months_to_default = 1;
+    keep account_id default_month;
+run;
+
+proc sort data=credit.default_events nodupkey;
+    by account_id;
+run;
+proc sql;
+    create table credit.facility_month_panel as
+    select
+        a.account_id,
+        a.cust_id,
+        a.product_type,
+        a.segment,
+        a.country,
+        a.obs_month,
+        b.default_month,
+        intck('month', a.obs_month, b.default_month) as months_to_default,
+        a.credit_limit,
+        a.outstanding_balance,
+        a.utilization_ratio,
+        a.payment_amount,
+        a.min_payment_due,
+        a.annual_interest_rate,
+        a.dpd_days,
+        a.ead_observed
+    from credit.ead_base_raw a
+    inner join credit.default_events b
+        on a.account_id = b.account_id
+    where calculated months_to_default between 1 and 12;
+quit;
+
+proc freq data=credit.facility_month_panel;
+    tables months_to_default / missing;
+run;
+proc sql;
+    create table credit.panel_gaps as
+    select
+        account_id,
+        count(distinct months_to_default) as obs_count
+    from credit.facility_month_panel
+    group by account_id
+    having obs_count < 12;
+quit;
+proc sql;
+    create table credit.default_events as
+    select
+        account_id,
+        min(default_month) as default_month format=yymmdd10.
+    from credit.ead_base_raw
+    group by account_id;
+quit;
+
+proc sql;
+    create table credit.ead_target as
+    select
+        a.account_id,
+        b.default_month,
+        a.ead_observed as ead_at_default
+    from credit.ead_base_raw a
+    inner join credit.default_events b
+        on a.account_id = b.account_id;
+quit;
+proc means data=credit.ead_target
+    min p1 p5 p50 p95 p99 max;
+    var ead_at_default;
+run;
+data credit.ead_ccf_base;
+    set credit.ead_base_raw;
+
+    /* EAD at default is already provided in the base */
+    ead_at_default = ead_observed;
+
+    /* keep modelling window only */
+    if 1 <= months_to_default <= 12;
+
+    keep account_id cust_id product_type segment country
+         obs_month default_month months_to_default
+         credit_limit outstanding_balance utilization_ratio
+         payment_amount min_payment_due annual_interest_rate dpd_days
+         ead_at_default;
+run;
+
+
+data credit.ccf_raw;
+    set credit.ead_ccf_base;
+
+    undrawn_amount = credit_limit - outstanding_balance;
+
+    if undrawn_amount > 0 then
+        ccf_raw = (ead_at_default - outstanding_balance) / undrawn_amount;
+    else
+        ccf_raw = .;
+run;
+proc means data=credit.ccf_final n p1 p5 p50 p95 p99 max;
+    var ccf_capped;
+run;
+
+proc univariate data=credit.ccf_final;
+    var ccf_capped;
+    histogram ccf_capped / midpoints=0 to 1 by 0.05;
+run;
+data CREDIT.CCF_FINAL_CLEAN;
+    set CREDIT.CCF_FINAL;
+
+    /* Overlimit / negative undrawn handling */
+    overlimit_flag = (undrawn_amount <= 0);
+
+    /* Protect ccf_raw */
+    if missing(ccf_raw) then ccf_raw = 0;
+
+    /* If no undrawn amount, CCF concept is not applicable */
+    if undrawn_amount <= 0 then ccf_raw = 0;
+
+    /* Cap to [0,1] */
+    if ccf_raw < 0 then ccf_raw = 0;
+    if ccf_raw > 1 then ccf_raw = 1;
+
+    /* Downturn cap used in policies (already in your data, but recalculated for safety) */
+    ccf_capped = min(ccf_raw, 0.95);
+run;
+proc sort data=CREDIT.CCF_FINAL_CLEAN;
+    by account_id obs_month;
+run;
+
+proc expand data=CREDIT.CCF_FINAL_CLEAN out=CREDIT.CCF_WIN_PANEL method=none;
+    by account_id;
+    id obs_month;
+
+    /* Rolling mean */
+    convert ccf_raw = ccf_mean_3m  / transformout=(movave 3);
+    convert ccf_raw = ccf_mean_6m  / transformout=(movave 6);
+    convert ccf_raw = ccf_mean_12m / transformout=(movave 12);
+
+    /* Rolling max */
+    convert ccf_raw = ccf_max_3m   / transformout=(movmax 3);
+    convert ccf_raw = ccf_max_6m   / transformout=(movmax 6);
+    convert ccf_raw = ccf_max_12m  / transformout=(movmax 12);
+run;
+
+/*----------------------------------------------------------
+Correct CCF with explicit denominator variables
+CCF_t = (Balance_{t} - Balance_{t-1})+ / Undrawn_{t-1}
+Also handles overlimit: if Undrawn_{t-1} = 0 => CCF = 1
+----------------------------------------------------------*/
+
+proc sort data=CREDIT.CCF_FINAL;
+  by account_id obs_month;
+run;
+
+data CREDIT.CCF_FINAL_CCF_FIX3;
+  set CREDIT.CCF_FINAL;
+  by account_id obs_month;
+
+  retain prev_balance prev_undrawn;
+
+  /* Current month undrawn + overlimit flag (for reporting) */
+  undrawn_amount = credit_limit - outstanding_balance;
+  overlimit_flag = (undrawn_amount < 0);
+
+  /* Initialize first record per account */
+  if first.account_id then do;
+    prev_balance = outstanding_balance;
+    prev_undrawn = max(undrawn_amount, 0);
+
+    add_drawdown = .;
+    ccf_raw      = .;
+    ccf_capped   = .;
+
+    /* Show denominator fields as missing for first row */
+    balance_t_1  = .;
+    undrawn_t_1  = .;
+
+    output;
+    return;
+  end;
+
+  /* Denominator month values (t-1) used in CCF */
+  balance_t_1 = prev_balance;
+  undrawn_t_1 = prev_undrawn;
+
+  /* Drawdown from t-1 to t */
+  add_drawdown = max(outstanding_balance - prev_balance, 0);
+
+  /* CCF calculation using undrawn at t-1 */
+  if undrawn_t_1 > 0 then ccf_raw = add_drawdown / undrawn_t_1;
+  else ccf_raw = 1;
+
+  /* Range + cap */
+  ccf_raw    = max(min(ccf_raw, 1), 0);
+  ccf_capped = min(ccf_raw, 0.95);
+
+  /* Update retained values AFTER calculation */
+  prev_balance = outstanding_balance;
+  prev_undrawn = max(undrawn_amount, 0);
+
+  output;
+
+  drop prev_balance prev_undrawn;
+run;
+
+proc sort data=CREDIT.CCF_WIN_PANEL;
+  by account_id descending obs_month;
+run;
+
+data CREDIT.EAD_MODEL_SNAPSHOT;
+  set CREDIT.CCF_WIN_PANEL;
+  by account_id descending obs_month;
+  if first.account_id;
+
+  keep account_id cust_id product_type segment country
+       obs_month default_month months_to_default
+       credit_limit outstanding_balance utilization_ratio
+       payment_amount min_payment_due annual_interest_rate dpd_days
+       ead_observed
+       ccf_mean_3m ccf_mean_6m ccf_mean_12m
+       ccf_max_3m  ccf_max_6m  ccf_max_12m;
+run;
+/*--------------------------------------------------------------*
+ | Chapter Step: Build final 1-row-per-account snapshot (T-1)    |
+ | + Run QC checks on the rolling CCF window features            |
+ *--------------------------------------------------------------*/
+
+/* 1) Ensure correct order so FIRST.account_id picks latest obs_month */
+proc sort data=CREDIT.CCF_WIN_PANEL out=CREDIT.CCF_WIN_PANEL_SRT;
+  by account_id descending obs_month;
+run;
+
+/* 2) Final snapshot = latest observation per account */
+data CREDIT.EAD_MODEL_SNAPSHOT;
+  set CREDIT.CCF_WIN_PANEL_SRT;
+  by account_id descending obs_month;
+  if first.account_id then do;
+
+    /* Optional: keep a clean model-ready view */
+    keep account_id cust_id product_type segment country
+         obs_month default_month months_to_default
+         credit_limit outstanding_balance utilization_ratio
+         payment_amount min_payment_due annual_interest_rate dpd_days
+         ead_observed
+         ccf_mean_3m ccf_mean_6m ccf_mean_12m
+         ccf_max_3m  ccf_max_6m  ccf_max_12m;
+
+    output;
+  end;
+run;
+
+/* 3) Quick distribution check (based on snapshot for modelling) */
+proc means data=CREDIT.EAD_MODEL_SNAPSHOT n nmiss min p1 p5 p50 p95 p99 max;
+    var ccf_mean_3m ccf_max_3m
+        ccf_mean_6m ccf_max_6m
+        ccf_mean_12m ccf_max_12m;
+run;
+
+/* 4) QC rule: max should never be less than mean for any window */
+data CREDIT.CCF_QC_BAD;
+    set CREDIT.EAD_MODEL_SNAPSHOT;
+
+    qc_fail_flag = 0;
+
+    if (ccf_max_3m  < ccf_mean_3m)  then qc_fail_flag = 1;
+    else if (ccf_max_6m  < ccf_mean_6m)  then qc_fail_flag = 1;
+    else if (ccf_max_12m < ccf_mean_12m) then qc_fail_flag = 1;
+
+    if qc_fail_flag = 1;
+run;
+
+proc sort data=CREDIT.CCF_WIN_PANEL;
+    by account_id obs_month;
+run;
+
+Step 2: Derive utilisation-based features
+
+data CREDIT.UTIL_FEATURES;
+    set CREDIT.CCF_WIN_PANEL;
+    by account_id;
+
+    /* Base utilisation */
+    util_current = utilization_ratio;
+
+    /* Lagged utilisation */
+    util_lag1 = lag(utilization_ratio);
+    if first.account_id then util_lag1 = .;
+
+    /* Utilisation change */
+    util_change_1m = util_current - util_lag1;
+
+    /* Flags */
+    util_overlimit_flag = (util_current > 1);
+
+run;
+
+proc expand data=CREDIT.UTIL_FEATURES out=CREDIT.UTIL_WINDOWS method=none;
+    by account_id;
+    id obs_month;
+
+    convert util_current = util_mean_3m / transformout=(movave 3);
+    convert util_current = util_mean_6m / transformout=(movave 6);
+    convert util_current = util_mean_12m / transformout=(movave 12);
+
+    convert util_current = util_max_3m  / transformout=(movmax 3);
+    convert util_current = util_max_6m  / transformout=(movmax 6);
+    convert util_current = util_max_12m / transformout=(movmax 12);
+
+    convert util_current = util_std_6m  / transformout=(movstd 6);
+run;
+proc means data=CREDIT.UTIL_WINDOWS
+           n nmiss min p1 p5 p50 p95 p99 max;
+    var util_current
+        util_mean_3m util_mean_6m util_mean_12m
+        util_max_3m  util_max_6m  util_max_12m
+        util_std_6m;
+run;
+proc sort data=CREDIT.UTIL_FEATURES out=CREDIT.UTIL_FEATURES_SRT;
+    by account_id obs_month;
+run;
+
+data CREDIT.DRAWDOWN_BEHAV;
+    set CREDIT.UTIL_FEATURES_SRT;
+    by account_id;
+
+    retain _lag1 _lag2;
+
+    /* reset at new account */
+    if first.account_id then do;
+        _lag1 = .;
+        _lag2 = .;
+    end;
+
+    /* output lags (correct) */
+    util_lag1 = _lag1;
+    util_lag2 = _lag2;
+
+    /* speed */
+    util_change_1m = util_current - util_lag1;
+
+    /* acceleration */
+    if n(util_lag1, util_lag2)=2 then
+        util_accel_1m = (util_current - util_lag1) - (util_lag1 - util_lag2);
+    else util_accel_1m = .;
+
+    /* spike flag (10% jump) */
+    util_spike_flag = (not missing(util_change_1m) and util_change_1m >= 0.10);
+
+    /* shift for next row */
+    _lag2 = _lag1;
+    _lag1 = util_current;
+
+    keep account_id obs_month util_current util_lag1 util_lag2
+         util_change_1m util_accel_1m util_spike_flag;
+run;
+
+
+data CREDIT.PAYMENT_BEHAV;
+    set CREDIT.EAD_MODEL_BASE;
+
+    /* Payment intensity */
+    if outstanding_balance > 0 then
+        pay_to_balance_ratio = payment_amount / outstanding_balance;
+    else pay_to_balance_ratio = .;
+
+    if min_payment_due > 0 then
+        pay_to_min_ratio = payment_amount / min_payment_due;
+    else pay_to_min_ratio = .;
+
+run;
+data CREDIT.EAD_BASE;
+    set CREDIT.CCF_WIN_PANEL;
+    util_current = utilization_ratio;
+run;
+proc sort data=CREDIT.EAD_BASE;
+    by account_id obs_month;
+run;
+
+data CREDIT.DRAWDOWN_BEHAV;
+    set CREDIT.EAD_BASE;
+    by account_id;
+
+    /* Lags */
+    util_lag1 = lag(util_current);
+    util_lag2 = lag2(util_current);
+
+    if first.account_id then do;
+        util_lag1 = .;
+        util_lag2 = .;
+    end;
+
+    /* Speed & Acceleration */
+    util_change_1m = util_current - util_lag1;
+    util_accel_1m  = util_change_1m - (util_lag1 - util_lag2);
+
+    /* Spike */
+    util_spike_flag = (not missing(util_change_1m) and util_change_1m >= 0.10);
+
+    /* Missed payment (only if both inputs exist) */
+    if not missing(payment_amount) and not missing(min_payment_due) then
+        missed_pmt_flag = (payment_amount < min_payment_due);
+    else missed_pmt_flag = .;
+
+    /* Interaction risk */
+    if util_spike_flag=1 and missed_pmt_flag=1 then risky_draw_pmt_flag=1;
+    else risky_draw_pmt_flag=0;
+
+    keep account_id obs_month
+         util_current util_lag1 util_lag2 util_change_1m util_accel_1m util_spike_flag
+         payment_amount min_payment_due missed_pmt_flag risky_draw_pmt_flag;
+run;
+data CREDIT.BEHAV_ANOMALY;
+    set CREDIT.PAY_DRAW_INTERACT;
+
+    /* Low payment + large drawdown */
+    if util_change_1m >= 0.10 and pay_to_balance_ratio < 0.05 then
+        behav_anomaly_flag = 1;
+    else behav_anomaly_flag = 0;
+
+run;
+
+proc sort data=CREDIT.EAD_BASE;
+    by account_id obs_month;
+run;
+
+data CREDIT.LIMIT_HISTORY;
+    set CREDIT.EAD_BASE;
+    by account_id;
+
+    limit_lag1 = lag(credit_limit);
+
+    if first.account_id then limit_lag1 = .;
+
+    limit_change = credit_limit - limit_lag1;
+
+    if limit_change > 0 then limit_change_type = 'INCREASE';
+    else if limit_change < 0 then limit_change_type = 'DECREASE';
+    else limit_change_type = 'NO_CHANGE';
+run;
+
+data CREDIT.LIMIT_FLAGS;
+    set CREDIT.LIMIT_HISTORY;
+
+    limit_increase_flag = (limit_change > 0);
+    limit_decrease_flag = (limit_change < 0);
+
+    abs_limit_change = abs(limit_change);
+run;
+
+proc means data=CREDIT.LIMIT_FLAGS noprint;
+    by account_id;
+    var limit_increase_flag limit_decrease_flag abs_limit_change;
+    output out=CREDIT.LIMIT_SUMMARY
+        sum(limit_increase_flag)=cnt_limit_increase
+        sum(limit_decrease_flag)=cnt_limit_decrease
+        mean(abs_limit_change)=avg_limit_change;
+run;
+data CREDIT.LIMIT_STABILITY;
+    set CREDIT.LIMIT_SUMMARY;
+
+    limit_stability_index =
+        cnt_limit_increase +
+        cnt_limit_decrease +
+        (avg_limit_change / 100000);
+run;
+data CREDIT.EAD_LIMIT_FINAL;
+    set CREDIT.LIMIT_HISTORY;
+
+    recent_limit_increase =
+        (limit_change > 0 and months_to_default <= 6);
+run;
+
+%let panel = CREDIT.CCF_WIN_PANEL_SRT;
+
+/* 1) Create util_current (if not present) */
+data CREDIT.PANEL_FIX;
+    set &panel;
+
+    /* If util_current is missing in source, derive it */
+    if missing(util_current) then util_current = utilization_ratio;
+run;
+
+/* 2) Build macro table from panel */
+data CREDIT.MACRO_TABLE;
+    set CREDIT.PANEL_FIX(keep=country obs_month);
+
+    length scenario $10;
+
+    policy_rate = 0.045 + (month(obs_month)-1) * (0.010/11);
+    liquidity_index = 0.72 - (month(obs_month)-1) * (0.10/11);
+
+    if liquidity_index <= 0.65 then scenario = 'ADVERSE';
+    else scenario = 'BASE';
+run;
+proc sort data=CREDIT.MACRO_TABLE nodupkey;
+    by country obs_month;
+run;
+
+proc sort data=CREDIT.PANEL_FIX;
+    by country obs_month;
+run;
+
+/* 3) Join + overlay */
+data CREDIT.PANEL_MACRO;
+    merge CREDIT.PANEL_FIX(in=a)
+          CREDIT.MACRO_TABLE(in=b);
+    by country obs_month;
+    if a;
+
+    macro_exact_match_flag = (b=1);
+
+    rate_shock_flag       = (policy_rate >= 0.050);
+    liquidity_stress_flag = (liquidity_index <= 0.62);
+
+    macro_overlay_factor = 0;
+    if rate_shock_flag       then macro_overlay_factor + 0.03;
+    if liquidity_stress_flag then macro_overlay_factor + 0.05;
+
+    util_current_stress = util_current * (1 + macro_overlay_factor);
+run;
+
+/* 4) Quick checks */
+proc freq data=CREDIT.PANEL_MACRO;
+    tables country*macro_exact_match_flag / missing;
+run;
+
+proc means data=CREDIT.PANEL_MACRO n min p50 p95 max;
+    var util_current util_current_stress macro_overlay_factor policy_rate liquidity_index;
+run;
+
+proc print data=CREDIT.PANEL_MACRO(obs=20);
+    var account_id country obs_month utilization_ratio util_current util_current_stress
+        policy_rate liquidity_index scenario rate_shock_flag liquidity_stress_flag macro_overlay_factor;
+run;
+data CREDIT.PANEL_MACRO_FLAGS;
+    set CREDIT.PANEL_MACRO;
+
+    /* defaults if macro missing */
+    if missing(policy_rate)     then policy_rate     = 0.05;
+    if missing(liquidity_index) then liquidity_index = 0.70;
+    if missing(scenario)        then scenario        = 'BASE';
+
+    rate_shock_flag       = (policy_rate >= 0.05);
+    liquidity_stress_flag = (liquidity_index <= 0.62);
+run;
+data CREDIT.PANEL_MACRO_OVERLAY;
+    set CREDIT.PANEL_MACRO_FLAGS;
+
+    macro_overlay_factor = 0;
+
+    if rate_shock_flag then macro_overlay_factor + 0.03;
+    if liquidity_stress_flag then macro_overlay_factor + 0.05;
+run;
+data CREDIT.PANEL_STRESSED;
+    set CREDIT.PANEL_MACRO_OVERLAY;
+
+    util_current_stress = util_current * (1 + macro_overlay_factor);
+run;
+proc freq data=CREDIT.PANEL_STRESSED;
+    tables country*macro_exact_match_flag / missing;
+run;
+proc means data=CREDIT.PANEL_STRESSED n min p50 p95 max;
+    var util_current util_current_stress macro_overlay_factor;
+run;
+data credit.dq_completeness_exceptions;
+    set credit.ead_base;
+    length rule_id $20 severity $10 action $10;
+
+    if missing(account_id)
+    or missing(obs_month)
+    or missing(product_type)
+    or missing(segment)
+    or missing(country)
+    or missing(credit_limit)
+    or missing(outstanding_balance)
+    or missing(utilization_ratio)
+    or missing(undrawn_amount)
+    or missing(ead_at_default) then do;
+
+        rule_id="EAD_COMP_01"; severity="CRITICAL"; action="REJECT";
+        output;
+    end;
+run;
+proc sort data=credit.ead_base out=work.ead_sorted;
+    by account_id obs_month;
+run;
+
+data credit.dq_grain_exceptions;
+    set work.ead_sorted;
+    by account_id obs_month;
+    length rule_id $20 severity $10 action $10;
+
+    if not (first.obs_month and last.obs_month) then do;
+        rule_id="EAD_GRAIN_01"; severity="CRITICAL"; action="REPAIR";
+        output;
+    end;
+run;
+
+%let tol_util  = 0.02;
+%let tol_amt   = 1.00;
+
+data credit.dq_integrity_exceptions;
+    set credit.ead_base;
+    length rule_id $20 severity $10 action $10;
+
+    if credit_limit <= 0 then do;
+        rule_id="EAD_INT_02"; severity="CRITICAL"; action="REJECT";
+        output;
+    end;
+    else do;
+        calc_util   = outstanding_balance / credit_limit;
+        calc_undraw = credit_limit - outstanding_balance;
+
+        if abs(calc_util - utilization_ratio) > &tol_util
+        or abs(calc_undraw - undrawn_amount) > &tol_amt then do;
+            rule_id="EAD_INT_01"; severity="CRITICAL"; action="REPAIR";
+            output;
+        end;
+    end;
+run;
+
+data credit.dq_ccf_invalid_exceptions;
+    set credit.ead_base;
+    length rule_id $20 severity $10 action $10;
+
+    if (undrawn_amount <= 0 or overlimit_flag=1) and ccf_raw=0 then do;
+        rule_id="EAD_CCF_01"; severity="CRITICAL"; action="REPAIR";
+        output;
+    end;
+run;
+data credit.dq_all_exceptions;
+    set credit.dq_completeness_exceptions
+        credit.dq_grain_exceptions
+        credit.dq_integrity_exceptions
+        credit.dq_ccf_invalid_exceptions;
+run;
+
+data credit.dq_ccf_invalid_exceptions;
+    set credit.ead_base;
+    length rule_id $20 severity $10 action $10;
+
+    if credit_limit > 0 then do;
+        calc_util   = outstanding_balance / credit_limit;
+        calc_undraw = credit_limit - outstanding_balance;
+    end;
+    else do;
+        calc_util   = .;
+        calc_undraw = .;
+    end;
+
+    if (undrawn_amount <= 0 or overlimit_flag=1) and ccf_raw=0 then do;
+        rule_id="EAD_CCF_01"; severity="CRITICAL"; action="REPAIR";
+        output;
+    end;
+run;
+%let cap_value = 0.95;
+
+data work.ead_clean_base;
+    set credit.ead_base;
+
+    obs_month_end = intnx('month', obs_month, 0, 'end');
+    format obs_month_end yymmdd10.;
+
+    if credit_limit > 0 then util_current = outstanding_balance / credit_limit;
+    else util_current = .;
+
+    cap_value = &cap_value;
+
+    ccf_raw_clean    = ccf_raw;
+    ccf_capped_clean = ccf_capped;
+
+    if (undrawn_amount <= 0 or overlimit_flag=1) then do;
+        ccf_raw_clean    = .;
+        ccf_capped_clean = .;
+    end;
+
+    if not missing(ccf_raw_clean) then
+        ccf_capped_clean = min(ccf_raw_clean, cap_value);
+run;
+
+proc sort data=work.ead_clean_base out=work.ead_clean_sorted;
+    by account_id obs_month_end;
+run;
+
+    set work.ead_clean_sorted;
+    by account_id;
+
+    array w3  (3)  _temporary_;
+    array w6  (6)  _temporary_;
+    array w12 (12) _temporary_;
+    retain i;
+
+    if first.account_id then do;
+        do i=1 to 3;  w3(i)=.;  end;
+        do i=1 to 6;  w6(i)=.;  end;
+        do i=1 to 12; w12(i)=.; end;
+    end;
+
+    do i=1 to 2;   w3(i)=w3(i+1);   end;  w3(3)=ccf_capped_clean;
+    do i=1 to 5;   w6(i)=w6(i+1);   end;  w6(6)=ccf_capped_clean;
+    do i=1 to 11;  w12(i)=w12(i+1); end;  w12(12)=ccf_capped_clean;
+
+    sumv=0; cnt=0; maxv=.;
+    do i=1 to 3;
+        if not missing(w3(i)) then do;
+            sumv + w3(i); cnt + 1;
+            if missing(maxv) or w3(i)>maxv then maxv=w3(i);
+        end;
+    end;
+    ccf_mean_3m_clean = ifn(cnt>0, sumv/cnt, .);
+    ccf_max_3m_clean  = maxv;
+
+    sumv=0; cnt=0; maxv=.;
+    do i=1 to 6;
+        if not missing(w6(i)) then do;
+            sumv + w6(i); cnt + 1;
+            if missing(maxv) or w6(i)>maxv then maxv=w6(i);
+        end;
+    end;
+    ccf_mean_6m_clean = ifn(cnt>0, sumv/cnt, .);
+    ccf_max_6m_clean  = maxv;
+
+    sumv=0; cnt=0; maxv=.;
+    do i=1 to 12;
+        if not missing(w12(i)) then do;
+            sumv + w12(i); cnt + 1;
+            if missing(maxv) or w12(i)>maxv then maxv=w12(i);
+        end;
+    end;
+    ccf_mean_12m_clean = ifn(cnt>0, sumv/cnt, .);
+    ccf_max_12m_clean  = maxv;
+
+    drop i sumv cnt maxv;
+run;
+proc sql;
+    create table credit.dq_validation_summary as
+    select
+      (select count(*) from credit.dq_completeness_exceptions) as completeness_exceptions,
+      (select count(*) from credit.dq_grain_exceptions)        as grain_exceptions,
+      (select count(*) from credit.dq_integrity_exceptions)    as integrity_exceptions,
+      (select count(*) from credit.dq_ccf_invalid_exceptions)  as ccf_invalid_exceptions,
+
+      sum((undrawn_amount<=0 or overlimit_flag=1)) as overlimit_rows,
+      sum((undrawn_amount<=0 or overlimit_flag=1) and missing(ccf_raw_clean)) as missing_ccf_raw_clean,
+      sum((undrawn_amount<=0 or overlimit_flag=1) and missing(ccf_capped_clean)) as missing_ccf_capped_clean,
+
+      sum(not missing(ccf_mean_3m_clean) and not missing(ccf_max_3m_clean) and ccf_max_3m_clean < ccf_mean_3m_clean)
+        as roll_violations
+    from credit.ead_ccf_features_final;
+quit;
+%let ds = credit.ead_model_base;
+%let id = account_id;
+
+data work.ead_base0;
+    set &ds;
+
+    /* Force obs_month to true month-end */
+    obs_month_end = intnx('month', obs_month, 0, 'end');
+    format obs_month_end yymmdd10.;
+
+    /* Bank rule: undrawn cannot be negative */
+    if not missing(credit_limit) and not missing(outstanding_balance) then
+        undrawn_amount = max(credit_limit - outstanding_balance, 0);
+    else undrawn_amount = .;
+
+    util_current = utilization_ratio;
+run;
+    set work.ead_base1;
+
+    delta = 0.02;  /* 2 percentage-point threshold */
+
+    if missing(util_current) or missing(util_next) then util_jump_flag = .;
+    else if (util_next - util_current) >= delta then util_jump_flag = 1;
+    else util_jump_flag = 0;
+
+    drop delta;
+run;
+
+proc freq data=work.ead_iv_base;
+    tables util_jump_flag / missing;
+run;
+%let ds = credit.ead_model_base;
+%let id = account_id;
+
+/*-----------------------------
+  STEP 0: Keep only needed vars (optional but safer)
+-----------------------------*/
+data work.ead_in0;
+    set &ds;
+run;
+
+/*-----------------------------
+  STEP 1: Normalize obs_month to month-end + derive undrawn
+-----------------------------*/
+data work.ead_base0;
+    set work.ead_in0;
+
+    /* Force obs_month_end to month-end (handles 2024-03-30 etc.) */
+    obs_month_end = intnx('month', obs_month, 0, 'end');
+    format obs_month_end yymmdd10.;
+
+    /* Derive undrawn (bank rule: cannot be negative) */
+    if not missing(credit_limit) and not missing(outstanding_balance) then
+        undrawn_amount = max(credit_limit - outstanding_balance, 0);
+    else undrawn_amount = .;
+
+    util_current = utilization_ratio;
+run;
+
+proc sort data=work.ead_base0 out=work.ead_sorted;
+    by &id obs_month_end;
+run;
+
+/*-----------------------------
+  STEP 2: Get next-month utilization using normalized date
+  (THIS IS WHAT WAS MISSING IN YOUR RUN)
+-----------------------------*/
+proc sql;
+    create table work.ead_base1 as
+    select  a.*,
+            b.util_current as util_next
+    from work.ead_sorted as a
+    left join work.ead_sorted as b
+      on a.&id = b.&id
+     and intnx('month', a.obs_month_end, 1, 'end') = b.obs_month_end
+    ;
+quit;
+
+/*-----------------------------
+  STEP 3: Create target util_jump_flag
+-----------------------------*/
+data work.ead_iv_base;
+    set work.ead_base1;
+
+    length util_jump_flag 8;
+    delta = 0.02;  /* 2 percentage-point threshold */
+
+    if missing(util_current) or missing(util_next) then util_jump_flag = .;
+    else if (util_next - util_current) >= delta then util_jump_flag = 1;
+    else util_jump_flag = 0;
+
+    drop delta;
+run;
+
+/* Check target distribution */
+title "Target distribution check: util_jump_flag";
+proc freq data=work.ead_iv_base;
+    tables util_jump_flag / missing;
+run;
+title;
+
+/* Keep only usable rows */
+data work.ead_iv_base;
+    set work.ead_iv_base;
+    if util_jump_flag in (0,1);
+run;
+
+/*-----------------------------
+  STEP 4: Bin variables (deciles)
+-----------------------------*/
+proc rank data=work.ead_iv_base out=work.ead_binned groups=10;
+    var utilization_ratio
+        undrawn_amount
+        credit_limit
+        outstanding_balance
+        payment_amount
+        min_payment_due
+        dpd_days;
+    ranks bin_util bin_undraw bin_limit bin_bal bin_pay bin_minpay bin_dpd;
+run;
+
+/*=========================================================
+  STEP 5: IV Macro (guard against tot_good=0 or tot_bad=0)
+=========================================================*/
+%macro calc_iv(in_ds=, bin_var=, target=, out_ds=, var_label=);
+
+    proc sql;
+        create table work._dist_ as
+        select
+            &bin_var as bin,
+            sum(case when &target = 0 then 1 else 0 end) as good,
+            sum(case when &target = 1 then 1 else 0 end) as bad
+        from &in_ds
+        where &target in (0,1)
+        group by &bin_var;
+    quit;
+
+    proc sql noprint;
+        select coalesce(sum(good),0), coalesce(sum(bad),0)
+          into :tot_good, :tot_bad
+        from work._dist_;
+    quit;
+
+    data work._woe_;
+        set work._dist_;
+        length variable $60;
+
+        variable="&var_label";
+        eps = 1E-10;
+
+        if (&tot_good=0 or &tot_bad=0) then iv_component = 0;
+        else do;
+            good_dist = good / &tot_good;
+            bad_dist  = bad  / &tot_bad;
+            woe = log( (good_dist + eps) / (bad_dist + eps) );
+            iv_component = (good_dist - bad_dist) * woe;
+        end;
+    run;
+
+    proc sql;
+        create table &out_ds as
+        select variable,
+               sum(iv_component) as iv format=12.6
+        from work._woe_;
+    quit;
+
+%mend;
+
+/*-----------------------------
+  STEP 6: Run IV for all candidate variables
+-----------------------------*/
+%let target = util_jump_flag;
+
+%calc_iv(in_ds=work.ead_binned, bin_var=bin_util,   target=&target, out_ds=work.iv_util,   var_label=utilization_ratio);
+%calc_iv(in_ds=work.ead_binned, bin_var=bin_undraw, target=&target, out_ds=work.iv_undraw, var_label=undrawn_amount);
+%calc_iv(in_ds=work.ead_binned, bin_var=bin_limit,  target=&target, out_ds=work.iv_limit,  var_label=credit_limit);
+%calc_iv(in_ds=work.ead_binned, bin_var=bin_bal,    target=&target, out_ds=work.iv_bal,    var_label=outstanding_balance);
+%calc_iv(in_ds=work.ead_binned, bin_var=bin_pay,    target=&target, out_ds=work.iv_pay,    var_label=payment_amount);
+%calc_iv(in_ds=work.ead_binned, bin_var=bin_minpay, target=&target, out_ds=work.iv_minpay, var_label=min_payment_due);
+%calc_iv(in_ds=work.ead_binned, bin_var=bin_dpd,    target=&target, out_ds=work.iv_dpd,    var_label=dpd_days);
+
+/* Consolidate to ONE row per variable */
+data work.iv_all;
+    set work.iv_util work.iv_undraw work.iv_limit work.iv_bal
+        work.iv_pay work.iv_minpay work.iv_dpd;
+run;
+
+proc sort data=work.iv_all nodupkey;
+    by variable;
+run;
+
+proc sort data=work.iv_all;
+    by descending iv;
+run;
+
+title "IV Table (Target = util_jump_flag)";
+proc print data=work.iv_all noobs;
+run;
+title;
+
+proc corr data=work.ead_iv_base
+          outp=work.corr_matrix
+          noprint;
+    var utilization_ratio
+        undrawn_amount
+        credit_limit
+        outstanding_balance
+        payment_amount
+        min_payment_due
+        dpd_days;
+run;
+
+High-correlation pairs are extracted:
+
+data work.corr_pairs;
+    set work.corr_matrix;
+    where _TYPE_ = 'CORR';
+    array v {*} utilization_ratio undrawn_amount credit_limit
+                 outstanding_balance payment_amount min_payment_due dpd_days;
+    do i = 1 to dim(v);
+        if abs(v{i}) >= 0.90 then do;
+            var1 = _NAME_;
+            var2 = vname(v{i});
+            r = v{i};
+            output;
+        end;
+    end;
+    keep var1 var2 r;
+run;
+
+
+proc means data=work.ead_iv_base
+           noprint;
+    class obs_month_end;
+    var utilization_ratio
+        undrawn_amount
+        credit_limit
+        dpd_days
+        payment_amount;
+    output out=work.stability_stats
+           mean=mean_
+           std=std_;
+run;
+proc reg data=work.ead_iv_base;
+    model util_jump_flag =
+          dpd_days
+          utilization_ratio
+          credit_limit
+          outstanding_balance
+          undrawn_amount
+          min_payment_due
+          payment_amount
+          / vif tol;
+run;
+quit;
+5.	summary checks to confirm it is usable.
+/*=========================================================
+  CHAPTER 20 — EAD MODELLING STRATEGY
+  SAS: Modelling base creation (CCF vs Direct EAD)
+=========================================================*/
+
+%let ds = credit.ead_model_base;   /* input base */
+%let id = account_id;
+%let cap_value = 0.95;
+
+/*---------------------------------------------------------
+  STEP 1: Standardise time grain + derive core exposure fields
+---------------------------------------------------------*/
+data work.ead_base0;
+    set &ds;
+
+    /* Normalise obs_month to true month-end */
+    obs_month_end = intnx('month', obs_month, 0, 'end');
+    format obs_month_end yymmdd10.;
+
+    /* Undrawn cannot be negative */
+    if not missing(credit_limit) and not missing(outstanding_balance) then
+        undrawn_amount = max(credit_limit - outstanding_balance, 0);
+    else undrawn_amount = .;
+
+    /* Utilisation snapshot */
+    util_current = utilization_ratio;
+
+    /* Over-limit flag */
+    if not missing(util_current) and util_current > 1 then overlimit_flag = 1;
+    else if not missing(util_current) then overlimit_flag = 0;
+run;
+
+proc sort data=work.ead_base0 out=work.ead_sorted;
+    by &id obs_month_end;
+run;
+
+/*---------------------------------------------------------
+  STEP 2: Product-wise segmentation tags (extend as needed)
+---------------------------------------------------------*/
+data work.ead_base_seg;
+    set work.ead_sorted;
+    length segment_model $20;
+
+    if product_type in ('CREDIT_CARD') then segment_model='CCF_CARD';
+    else if product_type in ('OVERDRAFT') then segment_model='CCF_OD';
+    else if product_type in ('SME_CREDIT_LINE') then segment_model='CCF_SME_LINE';
+    else if product_type in ('CORPORATE_REVOL') then segment_model='CCF_CORP_REVOL';
+    else segment_model='DIRECT_EAD_OTHER';
+run;
+
+/*---------------------------------------------------------
+  STEP 3A: Build CCF modelling base
+  - exclude rows where CCF cannot be defined (undrawn=0)
+---------------------------------------------------------*/
+data credit.ead_ccf_model_base;
+    set work.ead_base_seg;
+
+    /* CCF raw only when undrawn is positive and target exists */
+    if undrawn_amount > 0 and not missing(ead_observed) and not missing(outstanding_balance) then do;
+        ccf_raw = (ead_observed - outstanding_balance) / undrawn_amount;
+        /* Cap and floor */
+        ccf_capped = min(max(ccf_raw, 0), &cap_value);
+        ccf_valid_flag = 1;
+    end;
+    else do;
+        ccf_raw = .;
+        ccf_capped = .;
+        ccf_valid_flag = 0;
+    end;
+
+    /* Keep only CCF strategy products */
+    if segment_model in ('CCF_CARD','CCF_OD','CCF_SME_LINE','CCF_CORP_REVOL');
+run;
+
+/*---------------------------------------------------------
+  STEP 3B: Build DIRECT EAD modelling base
+---------------------------------------------------------*/
+data credit.ead_direct_model_base;
+    set work.ead_base_seg;
+
+    /* For direct approach, keep all products (or restrict if needed) */
+    ead_target = ead_observed;
+
+    /* Optional normalised target */
+    if credit_limit > 0 and not missing(ead_observed) then
+        util_at_default = ead_observed / credit_limit;
+    else util_at_default = .;
+run;
+
+/*---------------------------------------------------------
+  STEP 4: Quick validation summaries
+---------------------------------------------------------*/
+title "CCF Base — Validity Summary";
+proc freq data=credit.ead_ccf_model_base;
+    tables segment_model*ccf_valid_flag overlimit_flag / missing;
+run;
+
+title "CCF Base — CCF Distribution (raw vs capped)";
+proc means data=credit.ead_ccf_model_base n nmiss mean p1 p5 p50 p95 p99 max;
+    var ccf_raw ccf_capped;
+run;
+
+title "Direct EAD Base — Target Coverage";
+proc means data=credit.ead_direct_model_base n nmiss mean p50 p95 p99 max;
+    var ead_target util_at_default;
+run;
+title;
+
+/*=========================================================
+  CHAPTER 21 — BASELINE CCF MODELS (FINAL)
+  Base: CREDIT.EAD_CCF_MODEL_BASE
+=========================================================*/
+
+ods graphics on;
+
+/*-----------------------------
+  21.2 Base validation
+-----------------------------*/
+title "CCF Base row count";
+proc sql;
+  select count(*) as n_rows from credit.ead_ccf_model_base;
+quit;
+title;
+
+title "CCF Base — flags";
+proc freq data=credit.ead_ccf_model_base;
+  tables segment_model*ccf_valid_flag / missing;
+  tables overlimit_flag / missing;
+run;
+title;
+
+title "CCF distribution (raw vs capped)";
+proc means data=credit.ead_ccf_model_base n nmiss mean p1 p5 p50 p95 p99 max;
+  var ccf_raw ccf_capped;
+run;
+title;
+
+/*-----------------------------
+  21.3 Baseline linear model
+-----------------------------*/
+title "Chapter 21 — Baseline CCF Model (PROC REG)";
+proc reg data=credit.ead_ccf_model_base plots(maxpoints=5000)=diagnostics;
+  model ccf_capped =
+      dpd_days
+      utilization_ratio
+      credit_limit
+      outstanding_balance
+      undrawn_amount
+      payment_amount
+      min_payment_due
+      / vif tol;
+run;
+quit;
+title;
+
+/*=========================================================
+  21.4 Fractional response CCF model (CORRECT)
+=========================================================*/
+
+/*-----------------------------
+  OPTION A (Preferred): Beta regression via PROC GLIMMIX
+  Works if GLIMMIX supports DIST=BETA in your install.
+-----------------------------*/
+title "Chapter 21 — CCF Fractional Response (BETA, PROC GLIMMIX)";
+proc glimmix data=credit.ead_ccf_model_base;
+  model ccf_capped =
+      dpd_days
+      utilization_ratio
+      payment_amount
+      min_payment_due
+      / dist=beta link=logit solution;
+run;
+title;
+
+/*-----------------------------
+  OPTION B (Portable): Quasi-binomial on proportion (PROC GENMOD)
+  This avoids the 'binary response' error by using the
+  events/trials form (ccf_capped as a proportion).
+  We create pseudo-counts using a large trial weight.
+-----------------------------*/
+data work.ccf_prop;
+  set credit.ead_ccf_model_base;
+  trial_wt = 1000; /* large constant; stabilizes estimation */
+  ccf_event = round(ccf_capped * trial_wt);
+  ccf_nonevent = trial_wt - ccf_event;
+run;
+
+title "Chapter 21 — CCF Fractional Response (Quasi-binomial, PROC GENMOD)";
+proc genmod data=work.ccf_prop;
+  model ccf_event / trial_wt =
+      dpd_days
+      utilization_ratio
+      payment_amount
+      min_payment_due
+      / dist=binomial link=logit;
+run;
+quit;
+title;
+
+/*=========================================================
+  DIRECT EAD BASELINE — create ead_target_final safely
+=========================================================*/
+
+%let ds_direct = credit.ead_direct_model_base;
+
+/* 1) Create a standard target column no matter what the source name is */
+data credit.ead_direct_model_base2;
+    set &ds_direct;
+
+    /* Standardize target */
+    if not missing(ead_target) then ead_target_final = ead_target;
+    else if not missing(ead_observed) then ead_target_final = ead_observed;
+    else if not missing(ead_at_default) then ead_target_final = ead_at_default;
+    else ead_target_final = .;
+
+    /* Keep only rows with target */
+    if not missing(ead_target_final);
+run;
+
+/* 2) Run baseline direct EAD model + store predictions */
+proc glm data=credit.ead_direct_model_base2;
+    class segment_model;
+    model ead_target_final =
+        dpd_days
+        utilization_ratio
+        credit_limit
+        payment_amount
+        min_payment_due
+        segment_model;
+
+    output out=credit.ead_direct_pred
+        p=ead_pred
+        r=ead_resid;
+run;
+quit;
+
+/* 3) Apply Chapter 22 constraints to the predicted EAD (optional here, but correct) */
+data credit.ead_direct_pred_final;
+    set credit.ead_direct_pred;
+
+    ead_final = min(
+                    max(ead_pred, outstanding_balance),
+                    credit_limit
+                  );
+run;
+proc print data=credit.ead_pred_from_ccf(obs=20);
+    var account_id obs_month ccf_capped ccf_pred outstanding_balance undrawn_amount ead_pred;
+run;
+proc print data=credit.ead_direct_pred_final(obs=20);
+    var account_id obs_month ead_target_final ead_pred ead_final outstanding_balance credit_limit;
+run;
+
+data credit.ead_final_constrained;
+    set credit.ead_pred_from_ccf;   /* or credit.ead_direct_pred_final */
+
+    /* Enforce EAD >= outstanding balance */
+    ead_floor = max(ead_pred, outstanding_balance);
+
+    /* Enforce EAD <= credit limit */
+    ead_final = min(ead_floor, credit_limit);
+
+    drop ead_floor;
+run;
+/*=========================================================
+  CHAPTER 23 — SEGMENT-WISE EAD MODELS (CCF BASED)
+  Base dataset: CREDIT.EAD_CCF_MODEL_BASE
+  Output: scored datasets + model summaries per segment
+=========================================================*/
+
+%let base = credit.ead_ccf_model_base;
+%let outlib = credit;
+
+/* Keep only modelling-eligible rows */
+data work.ccf_base;
+    set &base;
+    /* ccf_valid_flag = 1 already marks usable rows */
+    if ccf_valid_flag = 1;
+run;
+
+proc sort data=work.ccf_base;
+    by segment_model;
+run;
+
+/* Create separate datasets */
+data work.ccf_card work.ccf_od work.ccf_sme work.ccf_corp;
+    set work.ccf_base;
+    select (segment_model);
+        when ('CCF_CARD')      output work.ccf_card;
+        when ('CCF_OD')        output work.ccf_od;
+        when ('CCF_SME_LINE')  output work.ccf_sme;
+        when ('CCF_CORP_REVOL')output work.ccf_corp;
+        otherwise;
+    end;
+run;
+
+23.4.2 Fit a baseline CCF model per segment and score ccf_pred
+%macro run_ccf_segment(ds=, seg=);
+
+title "Chapter 23 — Segment CCF Model (PROC REG): &seg";
+
+proc reg data=&ds;
+    model ccf_capped =
+        dpd_days
+        utilization_ratio
+        credit_limit
+        outstanding_balance
+        payment_amount
+        min_payment_due
+        / vif tol;
+
+    output out=&outlib..ccf_pred_&seg
+        p=ccf_pred
+        r=ccf_resid;
+run;
+quit;
+
+title;
+
+%mend;
+
+%run_ccf_segment(ds=work.ccf_card, seg=card);
+%run_ccf_segment(ds=work.ccf_od,   seg=od);
+%run_ccf_segment(ds=work.ccf_sme,  seg=sme);
+%run_ccf_segment(ds=work.ccf_corp, seg=corp);
+
+
+/*=========================================================
+  CHAPTER 23 — SEGMENT-WISE EAD (FROM SEGMENT CCF MODELS)
+  Base: CREDIT.EAD_CCF_MODEL_BASE
+  Output:
+    - CREDIT.CCF_PRED_<SEG>
+    - CREDIT.EAD_PRED_<SEG>
+=========================================================*/
+
+%let base = credit.ead_ccf_model_base;
+
+/*---------------------------------------------------------
+  STEP 1: Build segment-wise CCF prediction datasets
+---------------------------------------------------------*/
+%macro run_ccf_model(seg_value=, seg_short=);
+
+    %put NOTE: Running CCF model for &=seg_value -> &=seg_short;
+
+    /* Fit segment model and write predictions */
+    proc reg data=&base(where=(segment_model="&seg_value" and ccf_valid_flag=1));
+        model ccf_capped =
+            dpd_days
+            utilization_ratio
+            credit_limit
+            outstanding_balance
+            payment_amount
+            min_payment_due;
+
+        output out=credit.ccf_pred_&seg_short
+            p=ccf_pred
+            r=ccf_resid;
+    run;
+    quit;
+
+    /* Quick rowcount check */
+    title "Rowcount check: CREDIT.CCF_PRED_&seg_short";
+    proc sql;
+        select count(*) as n_rows from credit.ccf_pred_&seg_short;
+    quit;
+    title;
+
+%mend;
+
+%run_ccf_model(seg_value=CCF_CARD,      seg_short=card);
+%run_ccf_model(seg_value=CCF_OD,        seg_short=od);
+%run_ccf_model(seg_value=CCF_SME_LINE,  seg_short=sme);
+%run_ccf_model(seg_value=CCF_CORP_REVOL,seg_short=corp);
+
+
+/*---------------------------------------------------------
+  STEP 2: Convert predicted CCF to predicted EAD (Chapter 22)
+  Enforce:
+    - EAD >= outstanding_balance
+    - EAD <= credit_limit
+---------------------------------------------------------*/
+%macro build_ead_from_ccf(seg_short=);
+
+data credit.ead_pred_&seg_short;
+    set credit.ccf_pred_&seg_short;
+
+    /* Implied EAD from predicted CCF */
+    ead_pred = outstanding_balance + (ccf_pred * undrawn_amount);
+
+    /* Chapter 22 constraints */
+    ead_final = min(
+                    max(ead_pred, outstanding_balance),
+                    credit_limit
+                  );
+run;
+
+/* Quick summary */
+title "EAD prediction summary: CREDIT.EAD_PRED_&seg_short";
+proc means data=credit.ead_pred_&seg_short n nmiss mean p50 p95 p99 min max;
+    var ccf_capped ccf_pred ead_pred ead_final outstanding_balance credit_limit;
+run;
+title;
+
+%mend;
+
+%build_ead_from_ccf(seg_short=card);
+%build_ead_from_ccf(seg_short=od);
+%build_ead_from_ccf(seg_short=sme);
+%build_ead_from_ccf(seg_short=corp);
+
+
+%macro segment_qc(seg=);
+
+title "Segment QC — &seg (Predicted vs Observed)";
+proc means data=&outlib..ead_pred_&seg n nmiss mean p50 p95 p99 max;
+    var ead_observed ead_pred ead_final outstanding_balance credit_limit ccf_capped ccf_pred;
+run;
+
+title "Segment QC — &seg (Constraint activation rates)";
+proc sql;
+    create table work.qc_&seg as
+    select
+        "&seg" as segment length=10,
+        count(*) as n,
+        sum(ead_final = outstanding_balance) as hits_lower_bound,
+        sum(ead_final = credit_limit)        as hits_upper_bound,
+        calculated hits_lower_bound / calculated n as pct_lower format=percent8.2,
+        calculated hits_upper_bound / calculated n as pct_upper format=percent8.2
+    from &outlib..ead_pred_&seg;
+quit;
+
+proc print data=work.qc_&seg noobs; run;
+title;
+
+%mend;
+
+%segment_qc(seg=card);
+%segment_qc(seg=od);
+%segment_qc(seg=sme);
+%segment_qc(seg=corp);
+%let direct = credit.ead_direct_model_base;
+
+proc sort data=&direct out=work.ead_direct_sorted;
+    by segment_model;
+run;
+
+%macro run_direct(seg=);
+
+title "Chapter 23 — Direct EAD Model (PROC GLM): &seg";
+
+proc glm data=work.ead_direct_sorted(where=(segment_model="&seg"));
+    model ead_target_final =
+        dpd_days
+        utilization_ratio
+        credit_limit
+        payment_amount
+        min_payment_due;
+    output out=credit.ead_direct_pred_&seg
+        p=ead_pred
+        r=ead_resid;
+run;
+quit;
+
+data credit.ead_direct_pred_&seg;
+    set credit.ead_direct_pred_&seg;
+
+    /* Chapter 22 constraints */
+    ead_final = min(
+                    max(ead_pred, outstanding_balance),
+                    credit_limit
+                  );
+run;
+
+title;
+
+%mend;
+
+%run_direct(seg=CCF_CARD);
+%run_direct(seg=CCF_OD);
+%run_direct(seg=CCF_SME_LINE);
+%run_direct(seg=CCF_CORP_REVOL);
+
+data credit.ead_validation_base;
+    set credit.ead_scored_oot;
+    error = ead_pred - ead_observed;
+    abs_error = abs(error);
+    sq_error  = error**2;
+run;
+proc means data=credit.ead_validation_base mean;
+    class segment_model;
+    var error abs_error sq_error;
+    output out=credit.ead_accuracy_by_segment
+        mean(error)=bias
+        mean(abs_error)=mae
+        mean(sq_error)=mse;
+run;
+
+data credit.ead_accuracy_by_segment;
+    set credit.ead_accuracy_by_segment;
+    rmse = sqrt(mse);
+run;
+proc rank data=credit.ead_validation_base
+          out=credit.ead_deciles
+          groups=10;
+    var ead_pred;
+    ranks ead_decile;
+run;
+
+data credit.ead_deciles;
+    set credit.ead_deciles;
+    ead_decile = ead_decile + 1;
+run;
+
+SAS: Decile Summary Table
+
+proc means data=credit.ead_deciles mean;
+    class ead_decile;
+    var ead_pred ead_observed;
+    output out=credit.ead_decile_summary mean=;
+run;
+data credit.ead_decile_summary;
+    set credit.ead_decile_summary;
+    calibration_ratio = ead_observed / ead_pred;
+run;
+proc sgplot data=credit.ead_validation_base;
+    scatter x=ead_pred y=ead_observed;
+    lineparm x=0 y=0 slope=1;
+    xaxis label="Predicted EAD";
+    yaxis label="Observed EAD";
+run;
+
+SAS: Decile Curve
+
+proc sgplot data=credit.ead_decile_summary;
+    series x=ead_decile y=ead_pred;
+    series x=ead_decile y=ead_observed;
+    xaxis label="EAD Decile";
+    yaxis label="EAD Amount";
+run;
+/*========================================================
+  CH25 — Backtesting & Ongoing Monitoring (PSI/CSI + CCF migration)
+  Full working SAS code (no nested SUM() issue)
+  Uses:
+    DEV = CREDIT.EAD_FINAL_CONSTRAINED   (your baseline)
+    MON = CREDIT.EAD_SCORED_OOT         (your monitoring / OOT)
+========================================================*/
+
+/*-----------------------------
+  0) Inputs
+------------------------------*/
+%let dev_ds = credit.ead_final_constrained;
+%let mon_ds = credit.ead_scored_oot;
+
+/*-----------------------------
+  1) Utility: reset NOEXEC if session previously failed
+------------------------------*/
+options obs=max;
+proc sql; reset exec; quit;
+
+/*========================================================
+  2) PSI macro (numeric variable) — decile bucketing on DEV
+========================================================*/
+%macro calc_psi(dev_ds=, mon_ds=, var=, out_prefix=psi);
+
+    %local _tot_dev _tot_mon;
+
+    /* 0) Combine DEV + MON */
+    data work._psi_base;
+        set &dev_ds(in=a) &mon_ds(in=b);
+        length sample $3;
+        if a then sample='DEV';
+        else if b then sample='MON';
+        if missing(&var) then delete;
+        keep sample &var;
+    run;
+
+    /* 1) DEV deciles */
+    proc rank data=work._psi_base(where=(sample='DEV')) out=work._dev_binned groups=10;
+        var &var;
+        ranks bucket;
+    run;
+
+    data work._dev_binned;
+        set work._dev_binned;
+        bucket = bucket + 1; /* 1-10 */
+        keep &var bucket;
+    run;
+
+    /* 2) DEV cutpoints */
+    proc sql;
+        create table work._dev_cuts as
+        select bucket,
+               min(&var) as lo,
+               max(&var) as hi
+        from work._dev_binned
+        group by bucket
+        order by bucket;
+    quit;
+
+    /* boundary values */
+    proc sql;
+        create table work._dev_bounds as
+        select min(lo) as min_lo, max(hi) as max_hi
+        from work._dev_cuts;
+    quit;
+
+    /* 3) Apply DEV cutpoints to both DEV + MON */
+    proc sql;
+        create table work._psi_scored as
+        select a.sample,
+               a.&var,
+               coalesce(b.bucket,
+                        case
+                            when a.&var < d.min_lo then 1
+                            when a.&var > d.max_hi then 10
+                            else .
+                        end) as bucket
+        from work._psi_base a
+        left join work._dev_cuts b
+          on a.&var between b.lo and b.hi
+        left join work._dev_bounds d
+          on 1=1;
+    quit;
+
+    /* 4) Bucket counts */
+    proc sql;
+        create table work.&out_prefix._input as
+        select bucket, sample, count(*) as cnt
+        from work._psi_scored
+        group by bucket, sample
+        order by bucket, sample;
+    quit;
+
+    /* 5A) totals (avoid nested SUM()) */
+    proc sql noprint;
+        select sum(cnt) into :_tot_dev
+        from work.&out_prefix._input
+        where sample='DEV';
+
+        select sum(cnt) into :_tot_mon
+        from work.&out_prefix._input
+        where sample='MON';
+    quit;
+
+    /* 5B) proportions by bucket */
+    proc sql;
+        create table work.&out_prefix._calc as
+        select
+            bucket,
+            sum(case when sample='DEV' then cnt else 0 end) / &_tot_dev as exp_pct,
+            sum(case when sample='MON' then cnt else 0 end) / &_tot_mon as act_pct
+        from work.&out_prefix._input
+        group by bucket
+        order by bucket;
+    quit;
+
+    /* 6) PSI contribution per bucket */
+    data work.&out_prefix._detail;
+        set work.&out_prefix._calc;
+        if exp_pct>0 and act_pct>0 then psi = (act_pct-exp_pct)*log(act_pct/exp_pct);
+        else psi = 0;
+    run;
+
+    /* 7) PSI total */
+    proc means data=work.&out_prefix._detail nway sum;
+        var psi;
+        output out=work.&out_prefix._summary(drop=_type_ _freq_) sum=psi_value;
+    run;
+
+%mend;
+
+/*========================================================
+  3) PSI for key drivers (run these one-by-one or all)
+========================================================*/
+%calc_psi(dev_ds=&dev_ds, mon_ds=&mon_ds, var=utilization_ratio,  out_prefix=psi_util);
+%calc_psi(dev_ds=&dev_ds, mon_ds=&mon_ds, var=dpd_days,           out_prefix=psi_dpd);
+%calc_psi(dev_ds=&dev_ds, mon_ds=&mon_ds, var=credit_limit,       out_prefix=psi_limit);
+%calc_psi(dev_ds=&dev_ds, mon_ds=&mon_ds, var=outstanding_balance,out_prefix=psi_os);
+%calc_psi(dev_ds=&dev_ds, mon_ds=&mon_ds, var=undrawn_amount,     out_prefix=psi_undrawn);
+
+/* Consolidated PSI summary */
+data work.psi_summary_all;
+    length metric $40;
+    set
+      work.psi_util_summary    (in=a)
+      work.psi_dpd_summary     (in=b)
+      work.psi_limit_summary   (in=c)
+      work.psi_os_summary      (in=d)
+      work.psi_undrawn_summary (in=e);
+    if a then metric='utilization_ratio';
+    else if b then metric='dpd_days';
+    else if c then metric='credit_limit';
+    else if d then metric='outstanding_balance';
+    else if e then metric='undrawn_amount';
+run;
+
+proc print data=work.psi_summary_all noobs; run;
+
+/* Optional: view bucket-level PSI contributions */
+proc print data=work.psi_util_detail noobs; run;
+
+/*========================================================
+  4) CSI (Categorical Stability Index) for segment_model
+     CSI is PSI logic but on category distribution.
+========================================================*/
+proc sql;
+    create table work.csi_input as
+    select 'DEV' as sample length=3, segment_model, count(*) as cnt
+    from &dev_ds
+    group by segment_model
+
+    union all
+
+    select 'MON' as sample length=3, segment_model, count(*) as cnt
+    from &mon_ds
+    group by segment_model;
+quit;
+
+proc sql noprint;
+    select sum(cnt) into :csi_tot_dev from work.csi_input where sample='DEV';
+    select sum(cnt) into :csi_tot_mon from work.csi_input where sample='MON';
+quit;
+
+proc sql;
+    create table work.csi_calc as
+    select
+        segment_model,
+        sum(case when sample='DEV' then cnt else 0 end)/&csi_tot_dev as exp_pct,
+        sum(case when sample='MON' then cnt else 0 end)/&csi_tot_mon as act_pct
+    from work.csi_input
+    group by segment_model
+    order by segment_model;
+quit;
+
+data work.csi_detail;
+    set work.csi_calc;
+    if exp_pct>0 and act_pct>0 then csi = (act_pct-exp_pct)*log(act_pct/exp_pct);
+    else csi = 0;
+run;
+
+proc means data=work.csi_detail nway sum;
+    var csi;
+    output out=work.csi_summary(drop=_type_ _freq_) sum=csi_value;
+run;
+
+proc print data=work.csi_summary noobs; run;
+proc print data=work.csi_detail  noobs; run;
+
+/*========================================================
+  5) CCF migration tracking (distribution shift + mean CCF)
+     Requires: CCF observed (ccf_capped) and predicted (ccf_pred)
+     Use what you already have in EAD_SCORED_OOT or EAD_VALIDATION_BASE.
+========================================================*/
+%let mon_ccf_ds = credit.ead_scored_oot;  /* change if your MON dataset differs */
+%let dev_ccf_ds = credit.ead_final_constrained;
+
+proc sql;
+    create table work.ccf_migration as
+    select
+        'DEV' as sample length=3,
+        segment_model,
+        mean(ccf_capped) as ccf_mean_obs,
+        mean(ccf_pred)   as ccf_mean_pred,
+        count(*) as n
+    from &dev_ccf_ds
+    group by segment_model
+
+    union all
+
+    select
+        'MON' as sample length=3,
+        segment_model,
+        mean(ccf_capped) as ccf_mean_obs,
+        mean(ccf_pred)   as ccf_mean_pred,
+        count(*) as n
+    from &mon_ccf_ds
+    group by segment_model;
+quit;
+
+proc print data=work.ccf_migration noobs; run;
+
+/* Optional: simple time-based monitoring (if obs_month exists) */
+proc sql;
+    create table work.ccf_trend_mon as
+    select
+        obs_month,
+        segment_model,
+        mean(ccf_capped) as ccf_mean_obs,
+        mean(ccf_pred)   as ccf_mean_pred,
+        count(*) as n
+    from &mon_ccf_ds
+    group by obs_month, segment_model
+    order by obs_month, segment_model;
+quit;
+
+proc print data=work.ccf_trend_mon(obs=50) noobs; run;
+
+/*========================================================
+  6) Monitoring dashboard tables (ready for VA)
+========================================================*/
+data credit.monitoring_psi_summary;
+    set work.psi_summary_all;
+run;
+
+data credit.monitoring_csi_summary;
+    set work.csi_summary;
+run;
+
+data credit.monitoring_csi_detail;
+    set work.csi_detail;
+run;
+
+data credit.monitoring_ccf_migration;
+    set work.ccf_migration;
+run;
+
+data credit.monitoring_ccf_trend_mon;
+    set work.ccf_trend_mon;
+run;
+
+/* Done */
+proc print data=credit.monitoring_ccf_trend_mon;run;
+
+
+proc means data=credit.csi_input nway;
+    class variable_name bucket sample;
+    var cnt;
+    output out=csi_dist sum=;
+run;
+/*========================================================
+  CH25 - CCF Migration Tracking (Month-to-Month)
+  Creates CREDIT.CCF_MONITOR then migration matrix
+========================================================*/
+
+%let in_ds = credit.ead_scored_oot;   /* monitoring dataset (OOT) */
+/* If you want DEV migration instead, use: credit.ead_final_constrained */
+
+/*-------------------------------
+  1) Build monitor base
+--------------------------------*/
+data work.ccf_mon_base;
+    set &in_ds;
+
+    /* Ensure obs_month is a SAS date.
+       In your data, obs_month appears like 2024-10-30 etc.
+       If it's already SAS date numeric, keep it. If character, convert. */
+
+    /* If obs_month is character like '2024-10-30', uncomment:
+    obs_month_dt = input(obs_month, yymmdd10.);
+    format obs_month_dt yymmdd10.;
+    drop obs_month;
+    rename obs_month_dt = obs_month;
+    */
+
+    /* Keep only what we need */
+    keep account_id segment_model obs_month ccf_capped ccf_pred;
+run;
+
+/* Sort for lag logic */
+proc sort data=work.ccf_mon_base;
+    by segment_model account_id obs_month;
+run;
+
+/*---------------------------------------------
+  2) Define CCF bands (adjust cutoffs if needed)
+----------------------------------------------*/
+%macro ccf_band(x, outvar);
+    /* Bands:
+       1: [0.00 - 0.20)
+       2: [0.20 - 0.40)
+       3: [0.40 - 0.60)
+       4: [0.60 - 0.80)
+       5: [0.80 - 1.00]
+    */
+    if missing(&x) then &outvar = 'MISSING';
+    else if &x < 0.20 then &outvar='B1_0-20';
+    else if &x < 0.40 then &outvar='B2_20-40';
+    else if &x < 0.60 then &outvar='B3_40-60';
+    else if &x < 0.80 then &outvar='B4_60-80';
+    else &outvar='B5_80-100';
+%mend;
+
+/*-----------------------------------------------------------
+  3) Create prev vs current band using LAG within account_id
+------------------------------------------------------------*/
+data credit.ccf_monitor;
+    set work.ccf_mon_base;
+    by segment_model account_id;
+
+    length ccf_band_prev ccf_band_curr $12;
+
+    /* previous month values (within same account + segment) */
+    prev_ccf = lag(ccf_capped);
+    prev_acc = lag(account_id);
+    prev_seg = lag(segment_model);
+
+    /* reset lag when new account/segment starts */
+    if first.account_id or prev_acc ne account_id or prev_seg ne segment_model then prev_ccf = .;
+
+    /* banding */
+    %ccf_band(prev_ccf, ccf_band_prev);
+    %ccf_band(ccf_capped, ccf_band_curr);
+
+    /* keep only rows where a previous month exists */
+    if missing(prev_ccf) then delete;
+
+    drop prev_acc prev_seg;
+run;
+
+/*---------------------------------------------
+  4) Migration matrix (Prev band x Curr band)
+----------------------------------------------*/
+proc freq data=credit.ccf_monitor;
+    tables segment_model*ccf_band_prev*ccf_band_curr / nocol norow nopercent;
+run;
+
+/*---------------------------------------------
+  5) Optional: Migration summary table
+     (percentage distribution for each prev band)
+----------------------------------------------*/
+proc sql;
+    create table work.ccf_migration_counts as
+    select
+        segment_model,
+        ccf_band_prev,
+        ccf_band_curr,
+        count(*) as n
+    from credit.ccf_monitor
+    group by segment_model, ccf_band_prev, ccf_band_curr;
+
+    create table work.ccf_migration_pct as
+    select
+        a.segment_model,
+        a.ccf_band_prev,
+        a.ccf_band_curr,
+        a.n,
+        a.n / b.tot as pct format=percent10.2
+    from work.ccf_migration_counts a
+    inner join
+    (
+        select segment_model, ccf_band_prev, sum(n) as tot
+        from work.ccf_migration_counts
+        group by segment_model, ccf_band_prev
+    ) b
+    on a.segment_model=b.segment_model and a.ccf_band_prev=b.ccf_band_prev
+    order by segment_model, ccf_band_prev, ccf_band_curr;
+quit;
+
+proc print data=work.ccf_migration_pct noobs;
+run;
+data credit.ead_error;
+    set credit.ead_scored_oot;
+    error     = ead_pred - ead_observed;
+    abs_error = abs(error);
+    sq_error  = error**2;
+run;
+
+proc means data=credit.ead_error nway;
+    class segment_model;
+    var error abs_error sq_error;
+    output out=ead_accuracy
+        mean(error)=bias
+        mean(abs_error)=mae
+        mean(sq_error)=mse;
+run;
+
+data ead_accuracy;
+    set ead_accuracy;
+    rmse = sqrt(mse);
+run;
+
+/*========================================================
+  CH26: Downturn EAD Methodology - Data Preparation
+========================================================*/
+options mprint mlogic symbolgen;
+
+%let dev_ds = credit.ead_final_constrained;
+%let mon_ds = credit.ead_scored_oot;
+
+/* 1) Combine DEV + MON into one base */
+data work.dtn_base;
+    set &dev_ds(in=a) &mon_ds(in=b);
+
+    length sample $3;
+    if a then sample='DEV';
+    else if b then sample='MON';
+
+    /* Standardize date */
+    if missing(obs_month_end) and not missing(obs_month) then obs_month_end = obs_month;
+
+    /* Keep only usable rows */
+    if missing(segment_model) then delete;
+    if missing(utilization_ratio) and not missing(util_current) then utilization_ratio = util_current;
+
+    if missing(outstanding_balance) or missing(credit_limit) then delete;
+
+    /* if undrawn missing, derive */
+    if missing(undrawn_amount) then undrawn_amount = max(credit_limit - outstanding_balance, 0);
+
+    /* optional clean-ups */
+    if utilization_ratio < 0 then utilization_ratio = 0;
+    if utilization_ratio > 1.5 then utilization_ratio = 1.5; /* allow mild overlimit */
+
+run;
+
+/* Check counts */
+proc freq data=work.dtn_base;
+    tables sample / missing;
+run;
+
+proc freq data=work.dtn_base;
+    tables segment_model*sample / missing;
+run;
+/*========================================================
+  CH26 - DOWNTURN IDENTIFICATION + DOWNTURN FACTOR (CCF)
+  DEV vs MON
+  DEV  : CREDIT.EAD_FINAL_CONSTRAINED
+  MON  : CREDIT.EAD_SCORED_OOT
+========================================================*/
+
+options mprint mlogic symbolgen;
+
+/*--- USER INPUTS ---*/
+%let dev_ds = credit.ead_final_constrained;
+%let mon_ds = credit.ead_scored_oot;
+
+/* utilisation driver for downturn */
+%let util_var = utilization_ratio;
+
+/* CCF observed variable used to compute downturn factor
+   (change if your dataset uses ccf_capped / ccf_raw / ccf_observed etc.) */
+%let ccf_obs_var = ccf_raw;
+
+/* thresholds */
+%let k_std = 1.0;   /* 0.5 / 1.0 / 1.5 typical */
+%let pctl = 90;     /* tail trigger percentile, e.g. 90 or 95 */
+
+/*========================================================
+  0) BUILD DTN_BASE (DEV + MON combined)
+========================================================*/
+data work.dtn_base;
+    set &dev_ds(in=a) &mon_ds(in=b);
+
+    length sample $3;
+
+    if a then sample='DEV';
+    else if b then sample='MON';
+
+    /* Ensure month end is populated (your MON has obs_month_end) */
+    if missing(obs_month_end) then do;
+        /* if you only have obs_month, use month end */
+        if not missing(obs_month) then obs_month_end = intnx('month', obs_month, 0, 'E');
+    end;
+
+    /* Keep only rows with required fields */
+    if missing(segment_model) then delete;
+    if missing(&util_var) then delete;
+
+    format obs_month_end yymmdd10.;
+run;
+
+/* quick sanity */
+proc freq data=work.dtn_base;
+    tables sample segment_model*sample / missing;
+run;
+
+/*========================================================
+  1) DEV baseline stats (mean, std by segment)
+========================================================*/
+proc means data=work.dtn_base(where=(sample='DEV')) noprint;
+    class segment_model;
+    var &util_var;
+    output out=work.dev_util_stats(drop=_type_ _freq_)
+        mean=dev_util_mean
+        std =dev_util_std;
+run;
+
+/*========================================================
+  2) MON monthly stats (mean by segment x month)
+========================================================*/
+proc means data=work.dtn_base(where=(sample='MON')) noprint;
+    class segment_model obs_month_end;
+    var &util_var;
+    output out=work.mon_util_month(drop=_type_ _freq_)
+        mean=mon_util_mean;
+run;
+
+/*========================================================
+  3) MON monthly percentile trigger (segment x month)
+     NOTE: creates mon_util_p90 (or p95 etc.)
+========================================================*/
+proc univariate data=work.dtn_base(where=(sample='MON')) noprint;
+    class segment_model obs_month_end;
+    var &util_var;
+    output out=work.mon_util_pctl
+        pctlpts=&pctl
+        pctlpre=mon_util_p;
+run;
+
+/*========================================================
+  4) MERGE and flag downturn months
+     Trigger logic (segment-wise):
+       A) mon_mean >= dev_mean + k_std*dev_std  OR
+       B) mon_pctl >= dev_mean + 1.5*dev_std
+========================================================*/
+proc sql;
+    create table work.downturn_months as
+    select  a.segment_model,
+            a.obs_month_end,
+            a.mon_util_mean,
+            b.dev_util_mean,
+            b.dev_util_std,
+            c.mon_util_p&pctl as mon_util_pctl,
+            case
+              when a.mon_util_mean >= (b.dev_util_mean + &k_std*b.dev_util_std) then 1
+              when c.mon_util_p&pctl >= (b.dev_util_mean + 1.5*b.dev_util_std) then 1
+              else 0
+            end as downturn_flag
+    from work.mon_util_month a
+    left join work.dev_util_stats b
+      on a.segment_model=b.segment_model
+    left join work.mon_util_pctl c
+      on a.segment_model=c.segment_model
+     and a.obs_month_end=c.obs_month_end
+    order by a.segment_model, a.obs_month_end;
+quit;
+
+proc print data=work.downturn_months(obs=50);
+run;
+
+proc freq data=work.downturn_months;
+    tables segment_model*downturn_flag / missing;
+run;
+
+/*========================================================
+  5) APPLY downturn flag back to MON records (row-level)
+     so we can compute downturn CCF mean vs base mean
+========================================================*/
+proc sql;
+    create table work.mon_flagged as
+    select  a.*,
+            b.downturn_flag
+    from work.dtn_base(where=(sample='MON')) a
+    left join work.downturn_months b
+      on a.segment_model=b.segment_model
+     and a.obs_month_end=b.obs_month_end;
+quit;
+
+/*========================================================
+  6) COMPUTE downturn factor on CCF (segment-level)
+     factor = mean(CCF in downturn months) / mean(CCF in DEV)
+========================================================*/
+
+/* 6A) DEV CCF baseline mean */
+proc means data=work.dtn_base(where=(sample='DEV')) noprint;
+    class segment_model;
+    var &ccf_obs_var;
+    output out=work.dev_ccf_mean(drop=_type_ _freq_)
+        mean=ccf_base_mean;
+run;
+
+/* 6B) MON downturn CCF mean (only flagged months) */
+proc means data=work.mon_flagged(where=(downturn_flag=1)) noprint;
+    class segment_model;
+    var &ccf_obs_var;
+    output out=work.mon_ccf_down(drop=_type_ _freq_)
+        mean=ccf_down_mean;
+run;
+
+/* 6C) Combine to get downturn factor */
+proc sql;
+    create table work.downturn_factor_ccf as
+    select  coalesce(a.segment_model,b.segment_model) as segment_model length=20,
+            a.ccf_base_mean,
+            b.ccf_down_mean,
+            case
+              when a.ccf_base_mean>0 and b.ccf_down_mean>0 then (b.ccf_down_mean/a.ccf_base_mean)
+              else .
+            end as downturn_factor_ccf
+    from work.dev_ccf_mean a
+    full join work.mon_ccf_down b
+      on a.segment_model=b.segment_model
+    order by segment_model;
+quit;
+
+proc print data=work.downturn_factor_ccf;
+run;
+
+/*========================================================
+  7) OPTIONAL: overall portfolio factor (no segment split)
+========================================================*/
+proc means data=work.dtn_base(where=(sample='DEV')) noprint;
+    var &ccf_obs_var;
+    output out=work.dev_ccf_all mean=ccf_base_mean;
+run;
+
+proc means data=work.mon_flagged(where=(downturn_flag=1)) noprint;
+    var &ccf_obs_var;
+    output out=work.mon_ccf_all mean=ccf_down_mean;
+run;
+
+data work.downturn_factor_ccf_all;
+    merge work.dev_ccf_all work.mon_ccf_all;
+    if ccf_base_mean>0 and ccf_down_mean>0 then downturn_factor_ccf = ccf_down_mean/ccf_base_mean;
+    else downturn_factor_ccf = .;
+run;
+
+proc print data=work.downturn_factor_ccf_all;
+run;
+
+/*========================================================
+  CH26: Downturn Factor Computation (CCF-based)
+========================================================*/
+
+/* Attach downturn_flag back to MON records */
+proc sql;
+    create table work.mon_tagged as
+    select a.*,
+           b.downturn_flag
+    from work.dtn_base a
+    left join work.downturn_months b
+      on a.sample='MON'
+     and a.segment_model=b.segment_model
+     and a.obs_month_end=b.obs_month_end
+    where a.sample='MON';
+quit;
+
+/* DEV baseline CCF (mean) */
+proc means data=work.dtn_base(where=(sample='DEV')) noprint;
+    class segment_model;
+    var ccf_pred;
+    output out=work.dev_ccf_base(drop=_type_ _freq_) mean=ccf_base_mean;
+run;
+
+/* Downturn CCF mean (MON, downturn months only) */
+proc means data=work.mon_tagged(where=(downturn_flag=1)) noprint;
+    class segment_model;
+    var ccf_pred;
+    output out=work.mon_ccf_down(drop=_type_ _freq_) mean=ccf_down_mean;
+run;
+
+/* Factor table */
+proc sql;
+    create table credit.downturn_factors_ccf as
+    select a.segment_model,
+           a.ccf_base_mean,
+           b.ccf_down_mean,
+           case 
+             when a.ccf_base_mean>0 and b.ccf_down_mean>0 
+             then max(1, b.ccf_down_mean/a.ccf_base_mean)
+             else 1
+           end as downturn_factor_ccf
+    from work.dev_ccf_base a
+    left join work.mon_ccf_down b
+      on a.segment_model=b.segment_model
+    order by a.segment_model;
+quit;
+
+proc print data=credit.downturn_factors_ccf;
+run
+/*========================================================
+  CH26: Apply Downturn Overlay (CCF -> EAD)
+========================================================*/
+
+%let ccf_cap = 0.95;
+
+proc sql;
+    create table credit.ead_scored_oot_downturn as
+    select a.*,
+           coalesce(f.downturn_factor_ccf,1) as downturn_factor_ccf,
+           min(&ccf_cap, a.ccf_pred * coalesce(f.downturn_factor_ccf,1)) as ccf_downturn,
+           (a.outstanding_balance + a.undrawn_amount * calculated ccf_downturn) as ead_downturn
+    from &mon_ds a
+    left join credit.downturn_factors_ccf f
+      on a.segment_model=f.segment_model;
+quit;
+
+proc sql;
+    create table work.ccf_downturn_factor as
+    select
+        segment_model,
+        mean(case when downturn_flag=0 then &ccf_base_var end) as ccf_base_mean,
+        mean(case when downturn_flag=1 then &ccf_base_var end) as ccf_down_mean,
+        calculated ccf_down_mean / calculated ccf_base_mean
+            as downturn_factor_ccf
+    from work.ccf_with_flags
+    group by segment_model;
+quit;
+
+Step D — Regulatory floor (MANDATORY)
+data work.ccf_downturn_factor;
+    set work.ccf_downturn_factor;
+    downturn_factor_ccf = max(downturn_factor_ccf, 1.0);
+run;
+
+/*========================================================
+  CH26: Stress Scenarios (Revised)
+  - Fixes: floor CCF at 0, cap at 0.95
+  - Uses MON dataset directly (OOT)
+  - Produces: row-level stressed output + summary tables
+========================================================*/
+
+/*---- Inputs (edit if needed) ----*/
+%let mon_ds   = credit.ead_scored_oot;     /* monitoring / OOT scored file */
+%let ccf_var  = ccf_pred;                 /* base predicted CCF */
+%let cap_ccf  = 0.95;                     /* regulatory / policy cap */
+
+/*---- Create stressed scenarios ----*/
+data credit.ead_stress_scenarios_v2;
+    set &mon_ds;
+
+    length stress_scenario $12;
+    array mult[3] _temporary_ (1.05 1.10 1.20);
+    array scen[3] $12 _temporary_ ("MILD_5" "MOD_10" "SEV_20");
+
+    do i=1 to dim(mult);
+        stress_scenario = scen[i];
+
+        /* Revised: floor at 0, cap at 0.95 */
+        ccf_stress = max(0, min(&cap_ccf, &ccf_var * mult[i]));
+
+        /* EAD under stress (same structure you used) */
+        ead_stress = outstanding_balance + undrawn_amount * ccf_stress;
+
+        output;
+    end;
+
+    drop i;
+run;
+
+/*---- Distribution checks by scenario & segment ----*/
+proc means data=credit.ead_stress_scenarios_v2 n mean p50 p95 p99 min max;
+    class stress_scenario segment_model;
+    var ccf_stress ead_stress;
+run;
+
+/*---- Totals by scenario & segment ----*/
+proc sql;
+    create table work.ead_stress_totals_v2 as
+    select
+        stress_scenario,
+        segment_model,
+        count(*) as n,
+        sum(ead_stress) as total_ead_stress format=comma20.2,
+        mean(ead_stress) as avg_ead_stress format=comma20.2
+    from credit.ead_stress_scenarios_v2
+    group by stress_scenario, segment_model
+    order by stress_scenario, segment_model;
+quit;
+
+proc print data=work.ead_stress_totals_v2 noobs;
+run;
+
+/*---- Optional: compare base vs stress at portfolio level ----*/
+proc sql;
+    create table work.ead_stress_portfolio_v2 as
+    select
+        stress_scenario,
+        count(*) as n,
+        sum(ead_stress) as total_ead_stress format=comma20.2,
+        mean(ead_stress) as avg_ead_stress format=comma20.2
+    from credit.ead_stress_scenarios_v2
+    group by stress_scenario
+    order by stress_scenario;
+quit;
+
+proc print data=work.ead_stress_portfolio_v2 noobs;
+run;
+27.3.2 SAS Code — Scenario-Based EAD Stress Engine
+/*========================================================
+  CH27: Scenario-Based EAD Stress Testing
+========================================================*/
+
+/* Define monitoring dataset */
+%let mon_ds = credit.ccf_with_flags;
+
+/* Create stress scenarios */
+data credit.ead_stress_scenarios;
+    set &mon_ds;
+
+    length stress_scenario $12;
+
+    /* Scenario definitions */
+    array upl[3] _temporary_ (1.05 1.10 1.20);
+    array scen[3] $12 _temporary_ ("MILD_5" "MOD_10" "SEV_20");
+
+    do i = 1 to 3;
+        stress_scenario = scen[i];
+
+        /* Apply CCF stress with cap */
+        ccf_stress = min(0.95, ccf_pred * upl[i]);
+
+        /* Recalculate stressed EAD */
+        ead_stress = outstanding_balance
+                     + undrawn_amount * ccf_stress;
+
+        output;
+    end;
+
+    drop i;
+run;
+
+proc means data=credit.ead_stress_scenarios
+           mean p50 p95 p99 min max;
+    where stress_scenario = "MILD_5";
+    class segment_model;
+    var ccf_stress ead_stress;
+run;
+proc means data=credit.ead_stress_scenarios
+           mean p50 p95 p99 min max;
+    where stress_scenario = "MOD_10";
+    class segment_model;
+    var ccf_stress ead_stress;
+run;
+proc means data=credit.ead_stress_scenarios
+           mean p50 p95 p99 min max;
+    where stress_scenario = "SEV_20";
+    class segment_model;
+    var ccf_stress ead_stress;
+run;
+proc freq data=credit.ead_stress_scenarios;
+    where stress_scenario = "SEV_20";
+    tables segment_model / missing;
+run;
+
+proc sql;
+    create table credit.ead_stress_summary as
+    select
+        stress_scenario,
+        segment_model,
+        count(*) as n,
+        sum(ead_stress) as total_ead_stress,
+        mean(ead_stress) as avg_ead_stress
+    from credit.ead_stress_scenarios
+    group by stress_scenario, segment_model;
+quit;
+
+proc means data=credit.ead_stress_scenarios
+           mean p50 p95 p99 min max;
+    class stress_scenario;
+    var ead_stress;
+run;
+proc freq data=credit.ead_stress_scenarios;
+    tables stress_scenario;
+run;
+
+proc means data=credit.ead_stress_scenarios
+           mean p50 p95 p99 min max;
+    class stress_scenario segment_model;
+    var ccf_stress ead_stress;
+run;
+===============================================================*/
+
+/*---- Step 1: Create PD placeholder if it doesn't exist ----*/
+%macro ensure_pd_table;
+  %if not %sysfunc(exist(credit.pd_scored)) %then %do;
+    data credit.pd_scored;
+      set credit.ead_scored(keep=account_id segment_model);
+      length pd_final 8;
+      pd_final = .;   /* placeholder */
+    run;
+  %end;
+%mend;
+%ensure_pd_table;
+
+/*---- Step 2: Create LGD placeholder if it doesn't exist ----*/
+%macro ensure_lgd_table;
+  %if not %sysfunc(exist(credit.lgd_scored)) %then %do;
+    data credit.lgd_scored;
+      set credit.ead_scored(keep=account_id segment_model);
+      length lgd_final 8;
+      lgd_final = .;  /* placeholder */
+    run;
+  %end;
+%mend;
+%ensure_lgd_table;
+
+/*---- Step 3: Join EAD + PD + LGD into a single risk parameter table ----*/
+proc sql;
+    create table credit.risk_parameters_final as
+    select
+        a.account_id,
+        a.segment_model,
+        b.pd_final,
+        c.lgd_final,
+        a.ead_pred
+    from credit.ead_scored a
+    left join credit.pd_scored  b
+        on a.account_id = b.account_id
+    left join credit.lgd_scored c
+        on a.account_id = c.account_id;
+quit;
+
+/*---- Step 4: Quick validation using MEANS/FREQ ----*/
+proc freq data=credit.risk_parameters_final;
+  tables segment_model / missing;
+run;
+
+proc means data=credit.risk_parameters_final n mean min p95 p99 max;
+  class segment_model;
+  var ead_pred pd_final lgd_final;
+run;
+

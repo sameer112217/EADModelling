@@ -1,0 +1,1 @@
+account_id,cust_id,product_type,segment,country,obs_month,default_month,months_to_default,credit_limit,outstanding_balance,utilization_ratio,payment_amount,min_payment_due,annual_interest_rate,dpd_days,ead_observed,obs_month_end,overlimit_flag,ccf_capped,ccf_valid_flag,undrawn_amount
